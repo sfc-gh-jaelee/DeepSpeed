@@ -6,7 +6,7 @@
 import sys
 from typing import Optional
 from enum import Enum
-from pydantic import Field, model_validator
+from pydantic import Field, StrictBool, model_validator
 from deepspeed.runtime.config_utils import get_scalar_param, pp_int, DeepSpeedConfigModel
 from deepspeed.utils import logger
 from .offload_config import DeepSpeedZeroOffloadParamConfig, DeepSpeedZeroOffloadOptimizerConfig, OffloadDeviceEnum
@@ -50,6 +50,7 @@ ZeRO optimization should be enabled as:
     "override_module_apply": [true|false],
     "log_trace_cache_warnings" : [true|false],
     "enable_sanity_checks": [true|false],
+    "optimizer_state_swap": {"fraction": (0, 1], "stream": [true|false], "group_gib": 2.0},
     }
 }
 """
@@ -85,6 +86,40 @@ class ZeroStageEnum(int, Enum):
     gradients = 2
     weights = 3
     max_stage = 3
+
+
+class DeepSpeedZeroOptimizerStateSwapConfig(DeepSpeedConfigModel):
+    """
+    ZeRO stage 1 and 2: the FP32 master weights and optimizer state in pinned host memory outside the optimizer step
+    (see ``deepspeed/runtime/zero/optimizer_state_swap.py``). Replaces ``offload_optimizer``, which moves the step
+    itself to the CPU.
+    """
+
+    fraction: float = Field(gt=0, le=1)
+    """
+    Fraction of the FP32 masters and optimizer state, by bytes and in whole tensors in the optimizer's order, kept in
+    pinned host memory outside the step: fetched back from the end of the backward, evicted after the step. With
+    ``stream``, the fraction of the streamed param groups; the rest stay on the GPU.
+    """
+
+    stream: StrictBool = False
+    """
+    Stream the step group by group: the param groups are split into slices of at most ``group_gib`` GiB of FP32
+    master, each slice's state on the GPU only around its own step, for state that cannot be resident all at once.
+    """
+
+    group_gib: Optional[float] = Field(None, gt=0)
+    """
+    With ``stream``: the most FP32 master per param-group slice, in GiB (2 when unset). Changing ``stream`` or
+    ``group_gib`` changes the number of param groups, so a checkpoint does not load across that change.
+    """
+
+    @model_validator(mode="after")
+    def modes_valid(self):
+        if self.group_gib is not None and not self.stream:
+            raise ValueError("optimizer_state_swap.group_gib sizes the streamed step's param groups; set "
+                             "optimizer_state_swap.stream too")
+        return self
 
 
 class DeepSpeedZeroConfig(DeepSpeedConfigModel):
@@ -389,6 +424,12 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     Configuration for modules that should be treated as ZeRO3 leaf modules.
     """
 
+    optimizer_state_swap: Optional[DeepSpeedZeroOptimizerStateSwapConfig] = None
+    """
+    Stage 1 and 2: keep the FP32 master weights and optimizer state in pinned host memory outside the optimizer step.
+    Expects a dictionary containing values for :any:`DeepSpeedZeroOptimizerStateSwapConfig`.
+    """
+
     # Validators
     @model_validator(mode="after")
     def overlap_comm_valid(self):
@@ -407,6 +448,21 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
         offload_config = self.offload_optimizer
         if offload_config and offload_config.ratio < 1.0:
             assert self.stage == ZeroStageEnum.weights, "Partial offloading only supported for ZeRO Stage 3."
+        return self
+
+    @model_validator(mode="after")
+    def optimizer_state_swap_valid(self):
+        if self.optimizer_state_swap is not None:
+            if self.stage not in (ZeroStageEnum.optimizer_states, ZeroStageEnum.gradients):
+                raise ValueError(
+                    f"zero_optimization.optimizer_state_swap needs ZeRO stage 1 or 2, got stage {int(self.stage)}")
+            offload = self.offload_optimizer
+            if offload is not None and offload.device != OffloadDeviceEnum.none:
+                raise ValueError(
+                    "zero_optimization.optimizer_state_swap replaces zero_optimization.offload_optimizer; "
+                    "set one of them")
+            if self.zenflow is not None:
+                raise ValueError("zero_optimization.optimizer_state_swap does not support ZenFlow")
         return self
 
     @model_validator(mode="after")
